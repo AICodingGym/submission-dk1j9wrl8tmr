@@ -1,34 +1,18 @@
-def prefetch_with_limit(queryset, related_field, limit, to_attr):
+def prefetch_with_limit(queryset, related_name, limit, to_attr):
     """
-    Custom function to prefetch a limited number of related objects.
-
-    Args:
-        queryset: The base queryset to prefetch related objects for.
-        related_field: The related field name to prefetch.
-        limit: The number of related objects to fetch.
-        to_attr: The attribute name to store the prefetched objects.
-
-    Returns:
-        A queryset with the related objects prefetched and attached.
+    Prefetch a limited number of related objects for each object in the queryset.
     """
-    # Fetch all related objects for the given queryset
-    related_objects = (
-        queryset.model._meta.get_field(related_field).related_model.objects.filter(
-            **{f"{related_field}__in": queryset}
-        ).order_by('id')  # Ensure consistent ordering
+    related_model = queryset.model._meta.get_field(related_name).related_model
+    limited_queryset = related_model.objects.filter(
+        **{f"{queryset.model._meta.model_name}": OuterRef("pk")}
+    ).order_by("id")[:limit]
+    return queryset.prefetch_related(
+        Prefetch(
+            related_name,
+            queryset=related_model.objects.filter(id__in=Subquery(limited_queryset.values("id"))),
+            to_attr=to_attr,
+        )
     )
-
-    # Group related objects by their parent
-    grouped_objects = {}
-    for obj in related_objects:
-        parent_id = getattr(obj, f"{related_field}_id")
-        grouped_objects.setdefault(parent_id, []).append(obj)
-
-    # Attach the limited number of objects to each parent
-    for parent in queryset:
-        setattr(parent, to_attr, grouped_objects.get(parent.id, [])[:limit])
-
-    return queryset
 
 # filepath: /Users/isabellajiang/django-15957/django/urls.py
 from django.urls import path
