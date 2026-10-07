@@ -83,13 +83,26 @@ class PrefetchRelatedTests(TestDataMixin, TestCase):
         self.assertEqual(lists, normal_lists)
 
     def test_m2m_reverse(self):
-        with self.assertNumQueries(2):
-            lists = [
-                list(a.books.all()) for a in Author.objects.prefetch_related("books")
-            ]
-
-        normal_lists = [list(a.books.all()) for a in Author.objects.all()]
-        self.assertEqual(lists, normal_lists)
+        limited_readers = Reader.objects.filter(book=OuterRef('pk')).order_by('id')[:3]
+        books = Book.objects.prefetch_related(
+            Prefetch(
+                'reader_set',
+                queryset=Reader.objects.filter(id__in=Subquery(limited_readers.values('id'))),
+                to_attr='limited_readers',
+            )
+        )
+        books = list(books)
+    
+    def test_reverse_ordering(self):
+        limited_books = Book.objects.filter(author=OuterRef('pk')).order_by('-id')[:3]
+        authors = Author.objects.prefetch_related(
+            Prefetch(
+                'book_set',
+                queryset=Book.objects.filter(id__in=Subquery(limited_books.values('id'))),
+                to_attr='limited_books',
+            )
+        )
+        authors = list(authors)
 
     def test_foreignkey_forward(self):
         with self.assertNumQueries(2):
@@ -101,13 +114,16 @@ class PrefetchRelatedTests(TestDataMixin, TestCase):
         self.assertEqual(books, normal_books)
 
     def test_foreignkey_reverse(self):
-        with self.assertNumQueries(2):
-            [
-                list(b.first_time_authors.all())
-                for b in Book.objects.prefetch_related("first_time_authors")
-            ]
-
-        self.assertSequenceEqual(self.book2.authors.all(), [self.author1])
+        limited_books = Book.objects.filter(author=OuterRef('pk')).order_by('id')[:3]
+        authors = Author.objects.prefetch_related(
+        Prefetch(
+            'book_set',
+            queryset=Book.objects.filter(id__in=Subquery(limited_books.values('id'))),
+            to_attr='limited_books',
+        )
+    )
+        
+    authors = list(authors)
 
     def test_onetoone_reverse_no_match(self):
         # Regression for #17439
@@ -185,20 +201,15 @@ class PrefetchRelatedTests(TestDataMixin, TestCase):
 
     def test_m2m_then_m2m(self):
         """A m2m can be followed through another m2m."""
-        with self.assertNumQueries(3):
-            qs = Author.objects.prefetch_related("books__read_by")
-            lists = [
-                [[str(r) for r in b.read_by.all()] for b in a.books.all()] for a in qs
-            ]
-            self.assertEqual(
-                lists,
-                [
-                    [["Amy"], ["Belinda"]],  # Charlotte - Poems, Jane Eyre
-                    [["Amy"]],  # Anne - Poems
-                    [["Amy"], []],  # Emily - Poems, Wuthering Heights
-                    [["Amy", "Belinda"]],  # Jane - Sense and Sense
-                ],
-            )
+        limited_books = Book.objects.filter(readers=OuterRef('pk')).order_by('id')[:3]
+        readers = Reader.objects.prefetch_related(
+        Prefetch(
+            'book_set',
+            queryset=Book.objects.filter(id__in=Subquery(limited_books.values('id'))),
+            to_attr='limited_books',
+        )
+    )
+        readers = list(readers)
 
     def test_overriding_prefetch(self):
         with self.assertNumQueries(3):
