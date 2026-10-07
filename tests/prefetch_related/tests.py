@@ -211,6 +211,23 @@ class PrefetchRelatedTests(TestDataMixin, TestCase):
     )
         readers = list(readers)
 
+        # Modify the Prefetch logic to use Subquery for slicing
+    def get_limited_queryset(queryset, related_field, limit):
+        """
+        Returns a queryset limited to the specified number of related objects
+        using a Subquery.
+        """
+        limited_subquery = queryset.filter(**{related_field: OuterRef('pk')}).order_by('id')[:limit]
+        return queryset.filter(id__in=Subquery(limited_subquery.values('id')))
+
+    # Example usage in the source code
+    def prefetch_related_objects(queryset, related_field, limit, to_attr):
+        """
+        Prefetch related objects with a limit on the number of objects fetched.
+        """
+        limited_queryset = get_limited_queryset(queryset, related_field, limit)
+        return Prefetch(related_field, queryset=limited_queryset, to_attr=to_attr)
+
     def test_overriding_prefetch(self):
         with self.assertNumQueries(3):
             qs = Author.objects.prefetch_related("books", "books__read_by")
