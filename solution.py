@@ -13,9 +13,25 @@ from torch.utils.data import DataLoader, Dataset
 
 
 DATA_DIR = Path(__file__).parent / "data" / "ventilator-pressure-prediction"
-FEATURES = ["u_in", "u_out", "R", "C", "time_step"]
+FEATURES = [
+    "u_in", "u_out", "R", "C", "time_step",
+    "u_in_cumsum", "u_in_roll5", "R_times_C", "R_plus_C",
+]
 BATCH_SIZE = 256
-EPOCHS = 5
+EPOCHS = 20
+
+
+def add_features(frame):
+    """Add within-breath volume, short-term flow, and lung interactions."""
+    frame = frame.sort_values(["breath_id", "time_step"]).copy()
+    grouped = frame.groupby("breath_id", sort=False)
+    frame["u_in_cumsum"] = grouped["u_in"].cumsum()
+    frame["u_in_roll5"] = grouped["u_in"].transform(
+        lambda values: values.rolling(window=5, min_periods=1).mean()
+    )
+    frame["R_times_C"] = frame["R"] * frame["C"]
+    frame["R_plus_C"] = frame["R"] + frame["C"]
+    return frame
 
 
 class BreathDataset(Dataset):
@@ -49,12 +65,15 @@ class BreathDataset(Dataset):
         x = np.pad(x, ((0, pad), (0, 0)))
         y = np.pad(y, (0, pad))
         score_mask = np.pad(score_mask, (0, pad))
+        valid_mask = np.zeros(self.max_length, dtype=np.float32)
+        valid_mask[:length] = 1.0
         if row_ids is not None:
             row_ids = np.pad(row_ids, (0, pad), constant_values=-1)
         return (
             torch.from_numpy(x),
             torch.from_numpy(y),
             torch.from_numpy(score_mask),
+            torch.from_numpy(valid_mask),
             length,
             torch.from_numpy(row_ids) if row_ids is not None else torch.empty(0),
         )
@@ -68,23 +87,27 @@ class PressureLSTM(nn.Module):
             hidden_size=hidden_size,
             num_layers=2,
             batch_first=True,
-            dropout=0.1,
+            bidirectional=True,
+            dropout=0.2,
         )
+        self.hidden = nn.Linear(hidden_size * 2, hidden_size)
+        self.activation = nn.ReLU()
         self.output = nn.Linear(hidden_size, 1)
 
     def forward(self, x):
         sequence, _ = self.lstm(x)
-        return self.output(sequence).squeeze(-1)
+        return self.output(self.activation(self.hidden(sequence))).squeeze(-1)
 
 
-def masked_mae(prediction, target, mask):
+def masked_mae(prediction, target, score_mask, valid_mask):
+    mask = score_mask * valid_mask
     absolute_error = torch.abs(prediction - target) * mask
     return absolute_error.sum() / mask.sum().clamp_min(1.0)
 
 
 def main():
-    train = pd.read_csv(DATA_DIR / "train.csv")
-    test = pd.read_csv(DATA_DIR / "test.csv")
+    train = add_features(pd.read_csv(DATA_DIR / "train.csv"))
+    test = add_features(pd.read_csv(DATA_DIR / "test.csv"))
     max_length = max(
         int(train.groupby("breath_id").size().max()),
         int(test.groupby("breath_id").size().max()),
@@ -116,41 +139,51 @@ def main():
 
     model = PressureLSTM().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-5
+    )
 
     for epoch in range(EPOCHS):
         model.train()
         total_error = 0.0
         total_scored = 0.0
-        for x, target, mask, _, _ in train_loader:
-            x, target, mask = x.to(device), target.to(device), mask.to(device)
+        for x, target, score_mask, valid_mask, _, _ in train_loader:
+            x = x.to(device)
+            target = target.to(device)
+            score_mask = score_mask.to(device)
+            valid_mask = valid_mask.to(device)
             optimizer.zero_grad(set_to_none=True)
             prediction = model(x)
-            loss = masked_mae(prediction, target, mask)
+            loss = masked_mae(prediction, target, score_mask, valid_mask)
             loss.backward()
             optimizer.step()
+            mask = score_mask * valid_mask
             total_error += loss.item() * mask.sum().item()
             total_scored += mask.sum().item()
+        epoch_mae = total_error / max(total_scored, 1)
+        scheduler.step(epoch_mae)
         print(
             f"Epoch {epoch + 1}/{EPOCHS} - inspiratory MAE: "
-            f"{total_error / max(total_scored, 1):.5f}",
+            f"{epoch_mae:.5f} - lr: {optimizer.param_groups[0]['lr']:.2g}",
             flush=True,
         )
 
     model.eval()
     predictions_by_id = {}
+    test_u_out_by_id = test.set_index("id")["u_out"].to_dict()
     with torch.no_grad():
-        for x, _, _, lengths, row_ids in test_loader:
+        for x, _, _, _, lengths, row_ids in test_loader:
             prediction = model(x.to(device)).cpu().numpy()
             row_ids = row_ids.numpy()
             for batch_index, length in enumerate(lengths.tolist()):
                 for step in range(length):
-                    predictions_by_id[int(row_ids[batch_index, step])] = float(
-                        prediction[batch_index, step]
-                    )
+                    row_id = int(row_ids[batch_index, step])
+                    # Expiratory steps are excluded from inference output.
+                    if row_id >= 0 and int(test_u_out_by_id[row_id]) == 0:
+                        predictions_by_id[row_id] = float(prediction[batch_index, step])
 
     submission = test[["id", "u_out"]].copy()
-    submission["pressure"] = submission["id"].map(predictions_by_id)
-    submission.loc[submission["u_out"] == 1, "pressure"] = 0.0
+    submission["pressure"] = submission["id"].map(predictions_by_id).fillna(0.0)
     submission = submission[["id", "pressure"]]
     output_path = DATA_DIR / "submission.csv"
     submission.to_csv(output_path, index=False)
