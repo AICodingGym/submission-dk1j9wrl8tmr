@@ -13,9 +13,30 @@ from torch.utils.data import DataLoader, Dataset, Subset
 
 ROOT = Path(__file__).parent
 DATA_DIR = ROOT / "data" / "ventilator-pressure-prediction"
-FEATURES = ["u_in", "u_out", "R", "C", "time_step"]
+FEATURES = [
+    "u_in", "u_out", "R", "C", "time_step",
+    "u_in_cumsum", "u_in_roll5", "u_in_roll15",
+    "R_times_C", "R_times_u_in", "C_times_volume",
+]
 BATCH_SIZE = 256
-EPOCHS = 5
+EPOCHS = 20
+
+
+def add_features(frame):
+    """Build breath-local history and lung-mechanics features."""
+    frame = frame.sort_values(["breath_id", "time_step"]).copy()
+    groups = frame.groupby("breath_id", sort=False)
+    frame["u_in_cumsum"] = groups["u_in"].cumsum()
+    frame["u_in_roll5"] = groups["u_in"].transform(
+        lambda s: s.rolling(5, min_periods=1).mean()
+    )
+    frame["u_in_roll15"] = groups["u_in"].transform(
+        lambda s: s.rolling(15, min_periods=1).mean()
+    )
+    frame["R_times_C"] = frame["R"] * frame["C"]
+    frame["R_times_u_in"] = frame["R"] * frame["u_in"]
+    frame["C_times_volume"] = frame["C"] * frame["u_in_cumsum"]
+    return frame
 
 
 class BreathDataset(Dataset):
@@ -64,9 +85,16 @@ class PressureLSTM(nn.Module):
     def __init__(self):
         super().__init__()
         self.lstm = nn.LSTM(
-            input_size=len(FEATURES), hidden_size=128, num_layers=2, batch_first=True
+            input_size=len(FEATURES),
+            hidden_size=128,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.15,
         )
-        self.output = nn.Linear(128, 1)
+        self.head = nn.Sequential(
+            nn.Linear(256, 128), nn.ReLU(), nn.Linear(128, 1)
+        )
 
     def forward(self, x, lengths):
         packed = pack_padded_sequence(
@@ -76,7 +104,7 @@ class PressureLSTM(nn.Module):
         sequence, _ = pad_packed_sequence(
             packed_out, batch_first=True, total_length=x.shape[1]
         )
-        return self.output(sequence).squeeze(-1)
+        return self.head(sequence).squeeze(-1)
 
 
 def masked_mae(prediction, target, score_mask, lengths):
@@ -113,8 +141,8 @@ def run_epoch(model, loader, optimizer, device=None):
 def main():
     torch.manual_seed(42)
     np.random.seed(42)
-    train = pd.read_csv(DATA_DIR / "train.csv")
-    test = pd.read_csv(DATA_DIR / "test.csv")
+    train = add_features(pd.read_csv(DATA_DIR / "train.csv"))
+    test = add_features(pd.read_csv(DATA_DIR / "test.csv"))
 
     scaler = StandardScaler()
     scaler.fit(train[FEATURES])
@@ -143,10 +171,28 @@ def main():
     print(f"Training on {device}; input features: {FEATURES}")
     model = PressureLSTM().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-5
+    )
+    best_validation_mae = float("inf")
+    best_epoch = EPOCHS
     for epoch in range(EPOCHS):
         run_epoch(model, train_loader, optimizer, device)
         val_mae = run_epoch(model, val_loader, optimizer=None, device=device)
-        print(f"Epoch {epoch + 1}/{EPOCHS} - Validation MAE: {val_mae:.5f}", flush=True)
+        scheduler.step(val_mae)
+        if val_mae < best_validation_mae:
+            best_validation_mae = val_mae
+            best_epoch = epoch + 1
+        print(
+            f"Epoch {epoch + 1}/{EPOCHS} - Validation MAE: {val_mae:.5f} "
+            f"- lr: {optimizer.param_groups[0]['lr']:.2g}",
+            flush=True,
+        )
+    print(
+        f"Best validation MAE: {best_validation_mae:.5f} "
+        f"(epoch {best_epoch}); fitting final model on all breaths.",
+        flush=True,
+    )
 
     # Refit for the same number of epochs on every labeled breath.
     full_loader = DataLoader(
@@ -155,7 +201,7 @@ def main():
     )
     model = PressureLSTM().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    for _ in range(EPOCHS):
+    for _ in range(best_epoch):
         run_epoch(model, full_loader, optimizer, device)
 
     # Critical: associate every prediction with its own id, never with the
