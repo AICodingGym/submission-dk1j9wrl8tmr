@@ -9,11 +9,10 @@ from sklearn.preprocessing import StandardScaler
 train = pd.read_csv('data/ventilator-pressure-prediction/train.csv')
 test = pd.read_csv('data/ventilator-pressure-prediction/test.csv')
 
-# Features to use
 features = ['u_in', 'u_out', 'R', 'C', 'time_step']
 target = 'pressure'
 
-# 2. Scale features (very important for LSTMs)
+# 2. Scale features 
 scaler = StandardScaler()
 train_feats = scaler.fit_transform(train[features])
 test_feats = scaler.transform(test[features])
@@ -50,7 +49,6 @@ class VentilatorDataset(Dataset):
                 torch.tensor(self.y[idx], dtype=torch.float32), 
                 torch.tensor(self.u_out[idx], dtype=torch.float32))
 
-# Since all breaths are 32 timesteps long in this dataset, we don't need padding!
 train_dataset = VentilatorDataset(X_train, y_train, u_out_train)
 train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
 
@@ -80,7 +78,7 @@ for epoch in range(5):
         optimizer.zero_grad()
         preds = model(batch_X)
         
-        # ONLY mask where u_out == 0
+        # ONLY mask where u_out == 0 (inspiratory phase)
         mask = (batch_u == 0)
         loss = loss_fn(preds[mask], batch_y[mask]).mean()
         
@@ -102,7 +100,7 @@ with torch.no_grad():
 
 # Create submission
 sub = pd.DataFrame({'id': test['id'], 'pressure': all_preds})
-# Force expiratory phase to 0 (since it's not scored)
+# Force expiratory phase to 0 (since it's not scored and u_out==1 is just air leaving)
 sub.loc[test['u_out'] == 1, 'pressure'] = 0
 
 sub.to_csv('submission.csv', index=False)
