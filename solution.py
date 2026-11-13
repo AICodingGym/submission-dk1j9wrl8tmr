@@ -16,10 +16,10 @@ DATA_DIR = ROOT / "data" / "ventilator-pressure-prediction"
 FEATURES = [
     "u_in", "u_out", "R", "C", "time_step",
     "u_in_cumsum", "u_in_roll5", "u_in_roll15",
-    "R_times_C", "R_times_u_in", "C_times_volume",
+    "R_times_C", "R_times_u_in", "volume_over_C", "R_over_C",
 ]
 BATCH_SIZE = 256
-EPOCHS = 20
+EPOCHS = 40
 
 
 def add_features(frame):
@@ -35,7 +35,8 @@ def add_features(frame):
     )
     frame["R_times_C"] = frame["R"] * frame["C"]
     frame["R_times_u_in"] = frame["R"] * frame["u_in"]
-    frame["C_times_volume"] = frame["C"] * frame["u_in_cumsum"]
+    frame["volume_over_C"] = frame["u_in_cumsum"] / frame["C"].clip(lower=1e-6)
+    frame["R_over_C"] = frame["R"] / frame["C"].clip(lower=1e-6)
     return frame
 
 
