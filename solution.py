@@ -8,7 +8,7 @@ import torch
 from sklearn.preprocessing import StandardScaler
 from torch import nn
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 
 
 ROOT = Path(__file__).parent
@@ -19,7 +19,8 @@ FEATURES = [
     "R_times_C", "R_times_u_in", "volume_over_C", "R_over_C",
 ]
 BATCH_SIZE = 256
-EPOCHS = 40
+EPOCHS = 3
+ENSEMBLE_SEEDS = (42, 2025, 7)
 
 
 def add_features(frame):
@@ -62,7 +63,13 @@ class BreathDataset(Dataset):
 
     def __getitem__(self, index):
         x, y, mask, length, ids = self.samples[index]
-        return torch.from_numpy(x), torch.from_numpy(y), torch.from_numpy(mask), length, torch.from_numpy(ids)
+        return (
+            torch.from_numpy(x.copy()),
+            torch.from_numpy(y.copy()),
+            torch.from_numpy(mask.copy()),
+            length,
+            torch.from_numpy(ids.copy()),
+        )
 
 
 def collate_breaths(batch):
@@ -140,8 +147,6 @@ def run_epoch(model, loader, optimizer, device=None):
 
 
 def main():
-    torch.manual_seed(42)
-    np.random.seed(42)
     train = add_features(pd.read_csv(DATA_DIR / "train.csv"))
     test = add_features(pd.read_csv(DATA_DIR / "test.csv"))
 
@@ -150,60 +155,30 @@ def main():
     train_ds = BreathDataset(train, scaler, training=True)
     test_ds = BreathDataset(test, scaler, training=False)
 
-    # Hold out complete breaths for a trustworthy validation MAE.
-    rng = np.random.default_rng(42)
-    order = rng.permutation(len(train_ds))
-    split = int(0.9 * len(order))
-    train_indices, val_indices = order[:split].tolist(), order[split:].tolist()
-    train_loader = DataLoader(
-        Subset(train_ds, train_indices), batch_size=BATCH_SIZE,
-        shuffle=True, num_workers=0, collate_fn=collate_breaths,
-    )
-    val_loader = DataLoader(
-        Subset(train_ds, val_indices), batch_size=BATCH_SIZE,
-        shuffle=False, num_workers=0, collate_fn=collate_breaths,
-    )
-
     device = torch.device(
         "mps" if torch.backends.mps.is_available()
         else "cuda" if torch.cuda.is_available()
         else "cpu"
     )
     print(f"Training on {device}; input features: {FEATURES}")
-    model = PressureLSTM().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-5
-    )
-    best_validation_mae = float("inf")
-    best_epoch = EPOCHS
-    for epoch in range(EPOCHS):
-        run_epoch(model, train_loader, optimizer, device)
-        val_mae = run_epoch(model, val_loader, optimizer=None, device=device)
-        scheduler.step(val_mae)
-        if val_mae < best_validation_mae:
-            best_validation_mae = val_mae
-            best_epoch = epoch + 1
-        print(
-            f"Epoch {epoch + 1}/{EPOCHS} - Validation MAE: {val_mae:.5f} "
-            f"- lr: {optimizer.param_groups[0]['lr']:.2g}",
-            flush=True,
-        )
-    print(
-        f"Best validation MAE: {best_validation_mae:.5f} "
-        f"(epoch {best_epoch}); fitting final model on all breaths.",
-        flush=True,
-    )
-
-    # Refit for the same number of epochs on every labeled breath.
     full_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE, shuffle=True,
         num_workers=0, collate_fn=collate_breaths,
     )
-    model = PressureLSTM().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    for _ in range(best_epoch):
-        run_epoch(model, full_loader, optimizer, device)
+    models = []
+    for seed in ENSEMBLE_SEEDS:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        model = PressureLSTM().to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        for epoch in range(EPOCHS):
+            train_mae = run_epoch(model, full_loader, optimizer, device)
+            print(
+                f"Seed {seed}, epoch {epoch + 1}/{EPOCHS} - "
+                f"Training MAE: {train_mae:.5f}", flush=True,
+            )
+        model.eval()
+        models.append(model)
 
     # Critical: associate every prediction with its own id, never with the
     # original dataframe's positional order after grouping breaths.
@@ -213,18 +188,29 @@ def main():
     )
     test_u_out = test.set_index("id")["u_out"].to_dict()
     predictions_by_id = {}
-    model.eval()
     with torch.no_grad():
         for x, _, _, lengths, ids in test_loader:
-            predictions = model(x.to(device), lengths).cpu().numpy()
+            x = x.to(device)
+            predictions = np.mean(
+                [model(x, lengths).cpu().numpy() for model in models], axis=0
+            )
             for i, length in enumerate(lengths.tolist()):
                 for t in range(length):
                     row_id = int(ids[i, t])
                     if int(test_u_out[row_id]) == 0:
                         predictions_by_id[row_id] = float(predictions[i, t])
 
+    # The target pressure levels are evenly spaced; infer the grid from train.
+    pressure_levels = np.sort(train["pressure"].unique())
+    pressure_step = float(np.median(np.diff(pressure_levels)))
+    pressure_origin = float(pressure_levels[0])
     submission = test[["id", "u_out"]].copy()
-    submission["pressure"] = submission["id"].map(predictions_by_id).fillna(0.0)
+    prediction = submission["id"].map(predictions_by_id).fillna(0.0).to_numpy(copy=True)
+    inspiratory = submission["u_out"].to_numpy() == 0
+    prediction[inspiratory] = pressure_origin + np.rint(
+        (prediction[inspiratory] - pressure_origin) / pressure_step
+    ) * pressure_step
+    submission["pressure"] = prediction
     submission[["id", "pressure"]].to_csv(ROOT / "submission.csv", index=False)
     print(f"Saved {len(submission):,} predictions to {ROOT / 'submission.csv'}")
     print("TRAINING COMPLETE", flush=True)
