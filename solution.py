@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 
 
 DATA_DIR = Path(__file__).parent / "data" / "ventilator-pressure-prediction"
@@ -123,8 +123,22 @@ def main():
     test_dataset = BreathDataset(
         test, max_length, feature_mean, feature_scale, training=False
     )
+    rng = np.random.default_rng(42)
+    breath_order = rng.permutation(len(train_dataset))
+    split_at = int(0.9 * len(breath_order))
+    train_indices = breath_order[:split_at].tolist()
+    validation_indices = breath_order[split_at:].tolist()
     train_loader = DataLoader(
-        train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0
+        Subset(train_dataset, train_indices),
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=0,
+    )
+    validation_loader = DataLoader(
+        Subset(train_dataset, validation_indices),
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=0,
     )
     test_loader = DataLoader(
         test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0
@@ -136,6 +150,7 @@ def main():
         device = torch.device("cpu")
         print("MPS is unavailable; using CPU instead.")
     print(f"Training on {device}; maximum breath length is {max_length}.")
+    print(f"LSTM input features: {', '.join(FEATURES)}", flush=True)
 
     model = PressureLSTM().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -161,10 +176,27 @@ def main():
             total_error += loss.item() * mask.sum().item()
             total_scored += mask.sum().item()
         epoch_mae = total_error / max(total_scored, 1)
-        scheduler.step(epoch_mae)
+
+        # Validate on breaths never seen during this epoch's training.
+        model.eval()
+        validation_error = 0.0
+        validation_scored = 0.0
+        with torch.no_grad():
+            for x, target, score_mask, valid_mask, _, _ in validation_loader:
+                x = x.to(device)
+                target = target.to(device)
+                score_mask = score_mask.to(device)
+                valid_mask = valid_mask.to(device)
+                prediction = model(x)
+                mask = score_mask * valid_mask
+                validation_error += (torch.abs(prediction - target) * mask).sum().item()
+                validation_scored += mask.sum().item()
+        validation_mae = validation_error / max(validation_scored, 1)
+        scheduler.step(validation_mae)
         print(
-            f"Epoch {epoch + 1}/{EPOCHS} - inspiratory MAE: "
-            f"{epoch_mae:.5f} - lr: {optimizer.param_groups[0]['lr']:.2g}",
+            f"Epoch {epoch + 1}/{EPOCHS} - train MAE: {epoch_mae:.5f} - "
+            f"Validation MAE: {validation_mae:.5f} - "
+            f"lr: {optimizer.param_groups[0]['lr']:.2g}",
             flush=True,
         )
 
@@ -185,9 +217,10 @@ def main():
     submission = test[["id", "u_out"]].copy()
     submission["pressure"] = submission["id"].map(predictions_by_id).fillna(0.0)
     submission = submission[["id", "pressure"]]
-    output_path = DATA_DIR / "submission.csv"
+    output_path = Path(__file__).parent / "submission.csv"
     submission.to_csv(output_path, index=False)
     print(f"Saved {len(submission):,} predictions to {output_path}")
+    print("TRAINING COMPLETE", flush=True)
 
 
 if __name__ == "__main__":
