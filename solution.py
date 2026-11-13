@@ -1,7 +1,4 @@
-"""Train an LSTM pressure predictor and write submission.csv.
-
-Run from the repository root with: python solution.py
-"""
+"""Packed-sequence LSTM baseline for ventilator pressure prediction."""
 
 from pathlib import Path
 
@@ -9,74 +6,70 @@ import numpy as np
 import pandas as pd
 import torch
 from torch import nn
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from torch.utils.data import DataLoader, Dataset, Subset
 
 
-DATA_DIR = Path(__file__).parent / "data" / "ventilator-pressure-prediction"
-FEATURES = [
-    "u_in", "u_out", "R", "C", "time_step",
-    "u_in_cumsum", "u_in_roll5", "R_times_C", "R_plus_C",
-]
+ROOT = Path(__file__).parent
+DATA_DIR = ROOT / "data" / "ventilator-pressure-prediction"
+FEATURES = ["u_in", "u_out", "R", "C", "time_step"]
 BATCH_SIZE = 256
-EPOCHS = 20
-
-
-def add_features(frame):
-    """Add within-breath volume, short-term flow, and lung interactions."""
-    frame = frame.sort_values(["breath_id", "time_step"]).copy()
-    grouped = frame.groupby("breath_id", sort=False)
-    frame["u_in_cumsum"] = grouped["u_in"].cumsum()
-    frame["u_in_roll5"] = grouped["u_in"].transform(
-        lambda values: values.rolling(window=5, min_periods=1).mean()
-    )
-    frame["R_times_C"] = frame["R"] * frame["C"]
-    frame["R_plus_C"] = frame["R"] + frame["C"]
-    return frame
+EPOCHS = 5
 
 
 class BreathDataset(Dataset):
-    """One item per breath, with rows sorted in time order."""
+    """Store each breath as a variable-length sequence."""
 
-    def __init__(self, frame, max_length, feature_mean, feature_scale, training):
-        self.max_length = max_length
-        self.training = training
+    def __init__(self, frame, feature_mean, feature_scale, training):
         self.breaths = []
         for _, breath in frame.groupby("breath_id", sort=False):
             breath = breath.sort_values("time_step")
             x = breath[FEATURES].to_numpy(dtype=np.float32)
             x = (x - feature_mean) / feature_scale
             length = len(breath)
+
             if training:
                 y = breath["pressure"].to_numpy(dtype=np.float32)
                 score_mask = (breath["u_out"].to_numpy() == 0).astype(np.float32)
-                row_ids = None
+                ids = np.full(length, -1, dtype=np.int64)
             else:
                 y = np.zeros(length, dtype=np.float32)
                 score_mask = np.zeros(length, dtype=np.float32)
-                row_ids = breath["id"].to_numpy(dtype=np.int64)
-            self.breaths.append((x, y, score_mask, length, row_ids))
+                ids = breath["id"].to_numpy(dtype=np.int64)
+
+            self.breaths.append((x, y, score_mask, length, ids))
 
     def __len__(self):
         return len(self.breaths)
 
     def __getitem__(self, index):
-        x, y, score_mask, length, row_ids = self.breaths[index]
-        pad = self.max_length - length
-        x = np.pad(x, ((0, pad), (0, 0)))
-        y = np.pad(y, (0, pad))
-        score_mask = np.pad(score_mask, (0, pad))
-        valid_mask = np.zeros(self.max_length, dtype=np.float32)
-        valid_mask[:length] = 1.0
-        if row_ids is not None:
-            row_ids = np.pad(row_ids, (0, pad), constant_values=-1)
+        x, y, score_mask, length, ids = self.breaths[index]
         return (
             torch.from_numpy(x),
             torch.from_numpy(y),
             torch.from_numpy(score_mask),
-            torch.from_numpy(valid_mask),
             length,
-            torch.from_numpy(row_ids) if row_ids is not None else torch.empty(0),
+            torch.from_numpy(ids),
         )
+
+
+def collate_breaths(batch):
+    """Pad each batch and return lengths for packed-sequence processing."""
+    lengths = torch.tensor([item[3] for item in batch], dtype=torch.long)
+    max_length = int(lengths.max())
+    batch_size = len(batch)
+    x = torch.zeros(batch_size, max_length, len(FEATURES), dtype=torch.float32)
+    y = torch.zeros(batch_size, max_length, dtype=torch.float32)
+    score_mask = torch.zeros(batch_size, max_length, dtype=torch.float32)
+    ids = torch.full((batch_size, max_length), -1, dtype=torch.long)
+
+    for i, (seq_x, seq_y, seq_mask, length, seq_ids) in enumerate(batch):
+        x[i, :length] = seq_x
+        y[i, :length] = seq_y
+        score_mask[i, :length] = seq_mask
+        ids[i, :length] = seq_ids
+
+    return x, y, score_mask, lengths, ids
 
 
 class PressureLSTM(nn.Module):
@@ -85,63 +78,61 @@ class PressureLSTM(nn.Module):
         self.lstm = nn.LSTM(
             input_size=input_size,
             hidden_size=hidden_size,
-            num_layers=2,
+            num_layers=1,
             batch_first=True,
-            bidirectional=True,
-            dropout=0.2,
         )
-        self.hidden = nn.Linear(hidden_size * 2, hidden_size)
-        self.activation = nn.ReLU()
         self.output = nn.Linear(hidden_size, 1)
 
-    def forward(self, x):
-        sequence, _ = self.lstm(x)
-        return self.output(self.activation(self.hidden(sequence))).squeeze(-1)
+    def forward(self, x, lengths):
+        packed = pack_padded_sequence(
+            x, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+        packed_output, _ = self.lstm(packed)
+        sequence, _ = pad_packed_sequence(
+            packed_output, batch_first=True, total_length=x.size(1)
+        )
+        return self.output(sequence).squeeze(-1)
 
 
-def masked_mae(prediction, target, score_mask, valid_mask):
-    mask = score_mask * valid_mask
-    absolute_error = torch.abs(prediction - target) * mask
-    return absolute_error.sum() / mask.sum().clamp_min(1.0)
+def masked_mae(prediction, target, score_mask, lengths):
+    # The length mask excludes padding; score_mask excludes u_out == 1.
+    steps = torch.arange(prediction.size(1), device=prediction.device)[None, :]
+    valid_mask = steps < lengths.to(prediction.device)[:, None]
+    mask = score_mask * valid_mask.to(score_mask.dtype)
+    error = torch.abs(prediction - target) * mask
+    return error.sum() / mask.sum().clamp_min(1.0), mask.sum()
 
 
 def main():
-    train = add_features(pd.read_csv(DATA_DIR / "train.csv"))
-    test = add_features(pd.read_csv(DATA_DIR / "test.csv"))
-    max_length = max(
-        int(train.groupby("breath_id").size().max()),
-        int(test.groupby("breath_id").size().max()),
-    )
+    train = pd.read_csv(DATA_DIR / "train.csv")
+    test = pd.read_csv(DATA_DIR / "test.csv")
+    train = train.sort_values(["breath_id", "time_step"])
+    test = test.sort_values(["breath_id", "time_step"])
 
     feature_mean = train[FEATURES].mean().to_numpy(dtype=np.float32)
     feature_scale = train[FEATURES].std().to_numpy(dtype=np.float32)
     feature_scale[feature_scale < 1e-6] = 1.0
 
-    train_dataset = BreathDataset(
-        train, max_length, feature_mean, feature_scale, training=True
-    )
-    test_dataset = BreathDataset(
-        test, max_length, feature_mean, feature_scale, training=False
-    )
+    dataset = BreathDataset(train, feature_mean, feature_scale, training=True)
     rng = np.random.default_rng(42)
-    breath_order = rng.permutation(len(train_dataset))
-    split_at = int(0.9 * len(breath_order))
-    train_indices = breath_order[:split_at].tolist()
-    validation_indices = breath_order[split_at:].tolist()
+    order = rng.permutation(len(dataset))
+    split = int(0.9 * len(order))
+    train_set = Subset(dataset, order[:split].tolist())
+    validation_set = Subset(dataset, order[split:].tolist())
+
     train_loader = DataLoader(
-        Subset(train_dataset, train_indices),
+        train_set,
         batch_size=BATCH_SIZE,
         shuffle=True,
         num_workers=0,
+        collate_fn=collate_breaths,
     )
     validation_loader = DataLoader(
-        Subset(train_dataset, validation_indices),
+        validation_set,
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=0,
-    )
-    test_loader = DataLoader(
-        test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0
+        collate_fn=collate_breaths,
     )
 
     if torch.backends.mps.is_available():
@@ -149,77 +140,64 @@ def main():
     else:
         device = torch.device("cpu")
         print("MPS is unavailable; using CPU instead.")
-    print(f"Training on {device}; maximum breath length is {max_length}.")
-    print(f"LSTM input features: {', '.join(FEATURES)}", flush=True)
+    print(f"Training on {device} with packed variable-length sequences.")
 
     model = PressureLSTM().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-5
-    )
 
     for epoch in range(EPOCHS):
         model.train()
-        total_error = 0.0
-        total_scored = 0.0
-        for x, target, score_mask, valid_mask, _, _ in train_loader:
+        for x, target, score_mask, lengths, _ in train_loader:
             x = x.to(device)
             target = target.to(device)
             score_mask = score_mask.to(device)
-            valid_mask = valid_mask.to(device)
             optimizer.zero_grad(set_to_none=True)
-            prediction = model(x)
-            loss = masked_mae(prediction, target, score_mask, valid_mask)
+            prediction = model(x, lengths)
+            loss, _ = masked_mae(prediction, target, score_mask, lengths)
             loss.backward()
             optimizer.step()
-            mask = score_mask * valid_mask
-            total_error += loss.item() * mask.sum().item()
-            total_scored += mask.sum().item()
-        epoch_mae = total_error / max(total_scored, 1)
 
-        # Validate on breaths never seen during this epoch's training.
         model.eval()
-        validation_error = 0.0
-        validation_scored = 0.0
+        total_error = 0.0
+        total_scored = 0.0
         with torch.no_grad():
-            for x, target, score_mask, valid_mask, _, _ in validation_loader:
+            for x, target, score_mask, lengths, _ in validation_loader:
                 x = x.to(device)
                 target = target.to(device)
                 score_mask = score_mask.to(device)
-                valid_mask = valid_mask.to(device)
-                prediction = model(x)
-                mask = score_mask * valid_mask
-                validation_error += (torch.abs(prediction - target) * mask).sum().item()
-                validation_scored += mask.sum().item()
-        validation_mae = validation_error / max(validation_scored, 1)
-        scheduler.step(validation_mae)
-        print(
-            f"Epoch {epoch + 1}/{EPOCHS} - train MAE: {epoch_mae:.5f} - "
-            f"Validation MAE: {validation_mae:.5f} - "
-            f"lr: {optimizer.param_groups[0]['lr']:.2g}",
-            flush=True,
-        )
+                prediction = model(x, lengths)
+                loss, count = masked_mae(prediction, target, score_mask, lengths)
+                total_error += loss.item() * count.item()
+                total_scored += count.item()
+        val_mae = total_error / max(total_scored, 1.0)
+        print(f"Epoch {epoch + 1}/{EPOCHS} - Validation MAE: {val_mae:.5f}", flush=True)
 
+    test_dataset = BreathDataset(test, feature_mean, feature_scale, training=False)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate_breaths,
+    )
     model.eval()
-    predictions_by_id = {}
-    test_u_out_by_id = test.set_index("id")["u_out"].to_dict()
+    predictions = {}
+    test_u_out = test.set_index("id")["u_out"].to_dict()
     with torch.no_grad():
-        for x, _, _, _, lengths, row_ids in test_loader:
-            prediction = model(x.to(device)).cpu().numpy()
-            row_ids = row_ids.numpy()
-            for batch_index, length in enumerate(lengths.tolist()):
+        for x, _, _, lengths, ids in test_loader:
+            batch_predictions = model(x.to(device), lengths).cpu().numpy()
+            for i, length in enumerate(lengths.tolist()):
                 for step in range(length):
-                    row_id = int(row_ids[batch_index, step])
-                    # Expiratory steps are excluded from inference output.
-                    if row_id >= 0 and int(test_u_out_by_id[row_id]) == 0:
-                        predictions_by_id[row_id] = float(prediction[batch_index, step])
+                    row_id = int(ids[i, step])
+                    if int(test_u_out[row_id]) == 0:
+                        predictions[row_id] = float(batch_predictions[i, step])
 
     submission = test[["id", "u_out"]].copy()
-    submission["pressure"] = submission["id"].map(predictions_by_id).fillna(0.0)
+    submission["pressure"] = submission["id"].map(predictions).fillna(0.0)
     submission = submission[["id", "pressure"]]
-    output_path = Path(__file__).parent / "submission.csv"
+    output_path = ROOT / "submission.csv"
     submission.to_csv(output_path, index=False)
-    print(f"Saved {len(submission):,} predictions to {output_path}")
+    print(f"Saved submission to {output_path}")
     print("TRAINING COMPLETE", flush=True)
 
 
