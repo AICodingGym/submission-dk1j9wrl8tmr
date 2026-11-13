@@ -103,7 +103,38 @@ def masked_mae(prediction, target, score_mask, lengths):
     return error.sum() / mask.sum().clamp_min(1.0), mask.sum()
 
 
+def train_one_epoch(model, loader, optimizer, device):
+    model.train()
+    for x, target, score_mask, lengths, _ in loader:
+        x = x.to(device)
+        target = target.to(device)
+        score_mask = score_mask.to(device)
+        optimizer.zero_grad(set_to_none=True)
+        prediction = model(x, lengths)
+        loss, _ = masked_mae(prediction, target, score_mask, lengths)
+        loss.backward()
+        optimizer.step()
+
+
+def evaluate(model, loader, device):
+    model.eval()
+    total_error = 0.0
+    total_scored = 0.0
+    with torch.no_grad():
+        for x, target, score_mask, lengths, _ in loader:
+            x = x.to(device)
+            target = target.to(device)
+            score_mask = score_mask.to(device)
+            prediction = model(x, lengths)
+            loss, count = masked_mae(prediction, target, score_mask, lengths)
+            total_error += loss.item() * count.item()
+            total_scored += count.item()
+    return total_error / max(total_scored, 1.0)
+
+
 def main():
+    torch.manual_seed(42)
+    np.random.seed(42)
     train = pd.read_csv(DATA_DIR / "train.csv")
     test = pd.read_csv(DATA_DIR / "test.csv")
     train = train.sort_values(["breath_id", "time_step"])
@@ -146,31 +177,24 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     for epoch in range(EPOCHS):
-        model.train()
-        for x, target, score_mask, lengths, _ in train_loader:
-            x = x.to(device)
-            target = target.to(device)
-            score_mask = score_mask.to(device)
-            optimizer.zero_grad(set_to_none=True)
-            prediction = model(x, lengths)
-            loss, _ = masked_mae(prediction, target, score_mask, lengths)
-            loss.backward()
-            optimizer.step()
-
-        model.eval()
-        total_error = 0.0
-        total_scored = 0.0
-        with torch.no_grad():
-            for x, target, score_mask, lengths, _ in validation_loader:
-                x = x.to(device)
-                target = target.to(device)
-                score_mask = score_mask.to(device)
-                prediction = model(x, lengths)
-                loss, count = masked_mae(prediction, target, score_mask, lengths)
-                total_error += loss.item() * count.item()
-                total_scored += count.item()
-        val_mae = total_error / max(total_scored, 1.0)
+        train_one_epoch(model, train_loader, optimizer, device)
+        val_mae = evaluate(model, validation_loader, device)
         print(f"Epoch {epoch + 1}/{EPOCHS} - Validation MAE: {val_mae:.5f}", flush=True)
+
+    # The validation split is only for monitoring. Reinitialize and use every
+    # labeled breath for the final model so the submission does not discard 10%
+    # of the available training data.
+    full_loader = DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=0,
+        collate_fn=collate_breaths,
+    )
+    model = PressureLSTM().to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    for _ in range(EPOCHS):
+        train_one_epoch(model, full_loader, optimizer, device)
 
     test_dataset = BreathDataset(test, feature_mean, feature_scale, training=False)
     test_loader = DataLoader(
