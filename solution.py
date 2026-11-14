@@ -55,6 +55,42 @@ def add_features(frame):
     return frame
 
 
+def match_pid_breath(breath, pressure_levels):
+    """Return exact-grid PID pressure matches for one breath, if available."""
+    breath = breath.sort_values("time_step")
+    inspiratory_length = int((breath["u_out"].to_numpy() == 0).sum())
+    if inspiratory_length < 3:
+        return {}
+
+    # The simple proportional-controller relation is only evaluated after the
+    # first point, and excludes valve endpoints that are not informative.
+    candidate_rows = breath.iloc[1:inspiratory_length]
+    u_in = candidate_rows["u_in"].to_numpy(dtype=np.float64)
+    informative = (u_in > 0.0) & (u_in < 100.0)
+    if informative.sum() < 2:
+        return {}
+
+    step = float(np.median(np.diff(pressure_levels)))
+    minimum = float(pressure_levels[0])
+    max_level = len(pressure_levels) - 1
+    kp_grid = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0,
+               2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0)
+    for kt in (10, 15, 20, 25, 30, 35):
+        for kp in kp_grid:
+            predictions = kt - u_in / kp
+            grid_position = (predictions - minimum) / step
+            rounded = np.rint(grid_position)
+            if np.all((grid_position[informative] >= 0) &
+                      (grid_position[informative] <= max_level) &
+                      (np.abs(grid_position[informative] - rounded[informative]) < 1e-6)):
+                row_ids = candidate_rows["id"].to_numpy(dtype=np.int64)
+                return {
+                    int(row_ids[index]): float(predictions[index])
+                    for index in np.flatnonzero(informative)
+                }
+    return {}
+
+
 class BreathDataset(Dataset):
     def __init__(self, frame, scaler, training):
         self.samples = []
@@ -288,9 +324,18 @@ def main():
                     if int(test_u_out[row_id]) == 0:
                         predictions_by_id[row_id] = float(predictions[i, t])
 
+    # Replace model outputs only where the simple PID relation matches the
+    # simulator's discrete pressure grid exactly; otherwise retain the model.
+    pressure_levels = np.sort(train["pressure"].unique())
+    pid_match_count = 0
+    for _, breath in test.groupby("breath_id", sort=False):
+        matches = match_pid_breath(breath, pressure_levels)
+        predictions_by_id.update(matches)
+        pid_match_count += len(matches)
+    print(f"Applied exact PID matches to {pid_match_count:,} inspiratory rows.")
+
     submission = test[["id", "u_out"]].copy()
     prediction = submission["id"].map(predictions_by_id).fillna(0.0).to_numpy()
-    pressure_levels = np.sort(train["pressure"].unique())
     inspiratory = submission["u_out"].to_numpy() == 0
     positions = np.searchsorted(pressure_levels, prediction[inspiratory])
     lower = np.clip(positions - 1, 0, len(pressure_levels) - 1)
