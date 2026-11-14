@@ -250,7 +250,9 @@ def run_epoch(model, loader, optimizer, device=None, objective="mae"):
 
 def main():
     train = add_features(pd.read_csv(DATA_DIR / "train.csv"))
-    test = add_features(pd.read_csv(DATA_DIR / "test.csv"))
+    test = pd.read_csv(DATA_DIR / "test.csv")
+    test_id_order = test["id"].to_numpy(copy=True)
+    test = add_features(test)
 
     scaler = RobustScaler()
     scaler.fit(train[FEATURES])
@@ -359,7 +361,9 @@ def main():
         pid_match_count += len(matches)
     print(f"Applied exact PID matches to {pid_match_count:,} inspiratory rows.")
 
-    submission = test[["id", "u_out"]].copy()
+    # Restore the original test/sample-submission order after breath sorting.
+    submission = pd.DataFrame({"id": test_id_order})
+    submission["u_out"] = submission["id"].map(test_u_out)
     prediction = submission["id"].map(predictions_by_id).fillna(0.0).to_numpy(copy=True)
     inspiratory = submission["u_out"].to_numpy() == 0
     positions = np.searchsorted(pressure_levels, prediction[inspiratory])
