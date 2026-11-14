@@ -23,8 +23,9 @@ FEATURES = [
     "R_5", "R_20", "R_50", "C_10", "C_20", "C_50",
 ]
 BATCH_SIZE = 256
-EPOCHS = 5
-ENSEMBLE_SEEDS = (42, 2025)
+EPOCHS = 30
+ENSEMBLE_SEEDS = (42,)
+EARLY_STOPPING_PATIENCE = 6
 
 
 def add_features(frame):
@@ -153,7 +154,7 @@ class PressureLSTM(nn.Module):
             nn.Conv1d(64, 64, kernel_size=3, padding=1),
             nn.SiLU(),
         )
-        hidden_sizes = (512, 256, 128, 64)
+        hidden_sizes = (256, 128)
         self.lstm_layers = nn.ModuleList()
         input_size = 64
         for hidden_size in hidden_sizes:
@@ -279,6 +280,7 @@ def main():
         best_validation_mae = float("inf")
         best_state = None
         best_epoch = 0
+        epochs_without_improvement = 0
         for epoch in range(EPOCHS):
             run_epoch(model, train_loader, optimizer, device, objective="mae")
             val_mae = run_epoch(model, val_loader, optimizer=None, device=device)
@@ -290,12 +292,22 @@ def main():
                 best_validation_mae = val_mae
                 best_epoch = epoch + 1
                 best_state = deepcopy(model.state_dict())
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
             print(
                 f"Seed {seed}, epoch {epoch + 1}/{EPOCHS} - "
                 f"Validation MAE: {val_mae:.5f} - Validation MSE: {val_mse:.5f} - "
                 f"lr: {optimizer.param_groups[0]['lr']:.2g}",
                 flush=True,
             )
+            if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
+                print(
+                    f"Stopping early after {epoch + 1} epochs; validation MAE "
+                    f"has not improved for {EARLY_STOPPING_PATIENCE} epochs.",
+                    flush=True,
+                )
+                break
         model.load_state_dict(best_state)
         model.eval()
         models.append(model)
