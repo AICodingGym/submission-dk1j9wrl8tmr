@@ -23,7 +23,7 @@ FEATURES = [
     "R_5", "R_20", "R_50", "C_10", "C_20", "C_50",
 ]
 BATCH_SIZE = 256
-EPOCHS = 150
+EPOCHS = 5
 ENSEMBLE_SEEDS = (42, 2025)
 
 
