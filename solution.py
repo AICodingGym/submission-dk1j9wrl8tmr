@@ -154,6 +154,14 @@ class PressureLSTM(nn.Module):
             nn.Conv1d(64, 64, kernel_size=3, padding=1),
             nn.SiLU(),
         )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=64, nhead=4, dim_feedforward=128,
+            dropout=0.1, batch_first=True, activation="gelu",
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        self.residual_ffn = nn.Sequential(
+            nn.Linear(64, 128), nn.GELU(), nn.Dropout(0.1), nn.Linear(128, 64)
+        )
         hidden_sizes = (256, 128)
         self.lstm_layers = nn.ModuleList()
         input_size = 64
@@ -170,6 +178,11 @@ class PressureLSTM(nn.Module):
 
     def forward(self, x, lengths):
         x = self.front_end(x.transpose(1, 2)).transpose(1, 2)
+        steps = torch.arange(x.shape[1], device=x.device)[None, :]
+        padding_mask = steps >= lengths.to(x.device)[:, None]
+        transformed = self.transformer(x, src_key_padding_mask=padding_mask)
+        x = x + transformed
+        x = x + self.residual_ffn(x)
         packed = pack_padded_sequence(
             x, lengths.cpu(), batch_first=True, enforce_sorted=False
         )
@@ -274,8 +287,8 @@ def main():
         np.random.seed(seed)
         model = PressureLSTM().to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=EPOCHS, eta_min=1e-5
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-5
         )
         best_validation_mae = float("inf")
         best_state = None
@@ -287,7 +300,7 @@ def main():
             val_mse = run_epoch(
                 model, val_loader, optimizer=None, device=device, objective="mse"
             )
-            scheduler.step()
+            scheduler.step(val_mae)
             if val_mae < best_validation_mae:
                 best_validation_mae = val_mae
                 best_epoch = epoch + 1
