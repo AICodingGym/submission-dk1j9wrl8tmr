@@ -351,7 +351,7 @@ def main():
 
     # Replace model outputs only where the simple PID relation matches the
     # simulator's discrete pressure grid exactly; otherwise retain the model.
-    pressure_levels = np.sort(train["pressure"].unique())
+    pressure_levels = np.sort(train["pressure"].unique()).copy()
     pid_match_count = 0
     for _, breath in test.groupby("breath_id", sort=False):
         matches = match_pid_breath(breath, pressure_levels)
@@ -360,7 +360,7 @@ def main():
     print(f"Applied exact PID matches to {pid_match_count:,} inspiratory rows.")
 
     submission = test[["id", "u_out"]].copy()
-    prediction = submission["id"].map(predictions_by_id).fillna(0.0).to_numpy()
+    prediction = submission["id"].map(predictions_by_id).fillna(0.0).to_numpy(copy=True)
     inspiratory = submission["u_out"].to_numpy() == 0
     positions = np.searchsorted(pressure_levels, prediction[inspiratory])
     lower = np.clip(positions - 1, 0, len(pressure_levels) - 1)
@@ -368,8 +368,7 @@ def main():
     choose_upper = np.abs(pressure_levels[upper] - prediction[inspiratory]) < np.abs(
         pressure_levels[lower] - prediction[inspiratory]
     )
-    snapped = pressure_levels[lower]
-    snapped[choose_upper] = pressure_levels[upper[choose_upper]]
+    snapped = np.where(choose_upper, pressure_levels[upper], pressure_levels[lower])
     prediction[inspiratory] = snapped
     submission["pressure"] = prediction
     submission[["id", "pressure"]].to_csv(ROOT / "submission.csv", index=False)
