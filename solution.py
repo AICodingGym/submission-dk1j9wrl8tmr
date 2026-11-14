@@ -158,11 +158,11 @@ class PressureLSTM(nn.Module):
             d_model=64, nhead=4, dim_feedforward=128,
             dropout=0.1, batch_first=True, activation="gelu",
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
         self.residual_ffn = nn.Sequential(
             nn.Linear(64, 128), nn.GELU(), nn.Dropout(0.1), nn.Linear(128, 64)
         )
-        hidden_sizes = (256, 128)
+        hidden_sizes = (128, 64)
         self.lstm_layers = nn.ModuleList()
         input_size = 64
         for hidden_size in hidden_sizes:
