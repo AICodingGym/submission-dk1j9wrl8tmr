@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.preprocessing import RobustScaler
-from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.model_selection import StratifiedKFold
 from torch import nn
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from torch.utils.data import DataLoader, Dataset, Subset
@@ -26,6 +26,7 @@ BATCH_SIZE = 256
 EPOCHS = 30
 ENSEMBLE_SEEDS = (42,)
 EARLY_STOPPING_PATIENCE = 6
+CV_FOLDS = 10
 
 
 def add_features(frame):
@@ -250,6 +251,61 @@ def run_epoch(model, loader, optimizer, device=None, objective="mae"):
     return total_error / max(total_count, 1.0)
 
 
+def train_fold(train_ds, train_indices, val_indices, fold, seed, device):
+    train_loader = DataLoader(
+        Subset(train_ds, train_indices), batch_size=BATCH_SIZE,
+        shuffle=True, num_workers=0, collate_fn=collate_breaths,
+    )
+    val_loader = DataLoader(
+        Subset(train_ds, val_indices), batch_size=BATCH_SIZE,
+        shuffle=False, num_workers=0, collate_fn=collate_breaths,
+    )
+    torch.manual_seed(seed + fold)
+    np.random.seed(seed + fold)
+    model = PressureLSTM().to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-5
+    )
+    best_validation_mae = float("inf")
+    best_state = None
+    best_epoch = 0
+    epochs_without_improvement = 0
+    for epoch in range(EPOCHS):
+        run_epoch(model, train_loader, optimizer, device, objective="mae")
+        val_mae = run_epoch(model, val_loader, optimizer=None, device=device)
+        val_mse = run_epoch(
+            model, val_loader, optimizer=None, device=device, objective="mse"
+        )
+        scheduler.step(val_mae)
+        if val_mae < best_validation_mae:
+            best_validation_mae = val_mae
+            best_epoch = epoch + 1
+            best_state = deepcopy(model.state_dict())
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+        print(
+            f"Fold {fold + 1}/{CV_FOLDS}, epoch {epoch + 1}/{EPOCHS} - "
+            f"Validation MAE: {val_mae:.5f} - Validation MSE: {val_mse:.5f} - "
+            f"lr: {optimizer.param_groups[0]['lr']:.2g}",
+            flush=True,
+        )
+        if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
+            print(
+                f"Fold {fold + 1}: stopping early after {epoch + 1} epochs.",
+                flush=True,
+            )
+            break
+    model.load_state_dict(best_state)
+    model.eval()
+    print(
+        f"Fold {fold + 1}: best validation MAE {best_validation_mae:.5f} "
+        f"at epoch {best_epoch}.", flush=True,
+    )
+    return model
+
+
 def main():
     train = add_features(pd.read_csv(DATA_DIR / "train.csv"))
     test = pd.read_csv(DATA_DIR / "test.csv")
@@ -261,20 +317,12 @@ def main():
     train_ds = BreathDataset(train, scaler, training=True)
     test_ds = BreathDataset(test, scaler, training=False)
 
-    # Keep whole breaths together and balance the R/C settings in the holdout.
+    # Keep whole breaths together and balance the R/C settings in every fold.
     breath_settings = train.groupby("breath_id", sort=False)[["R", "C"]].first()
     strata = breath_settings["R"].astype(str) + "_" + breath_settings["C"].astype(str)
-    splitter = StratifiedShuffleSplit(n_splits=1, test_size=0.1, random_state=42)
-    train_indices, val_indices = next(
+    splitter = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=42)
+    folds = list(
         splitter.split(np.zeros(len(train_ds)), strata.to_numpy())
-    )
-    train_loader = DataLoader(
-        Subset(train_ds, train_indices), batch_size=BATCH_SIZE,
-        shuffle=True, num_workers=0, collate_fn=collate_breaths,
-    )
-    val_loader = DataLoader(
-        Subset(train_ds, val_indices), batch_size=BATCH_SIZE,
-        shuffle=False, num_workers=0, collate_fn=collate_breaths,
     )
 
     device = torch.device(
@@ -283,55 +331,16 @@ def main():
         else "cpu"
     )
     print(f"Training on {device}; input features: {FEATURES}")
-    # Train two independently initialized models on the same breath holdout.
-    # Keep each seed's best validation checkpoint and average them at inference.
+    # Train one hybrid model per stratified fold and aggregate with a median.
     models = []
     for seed in ENSEMBLE_SEEDS:
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        model = PressureLSTM().to(device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-5
-        )
-        best_validation_mae = float("inf")
-        best_state = None
-        best_epoch = 0
-        epochs_without_improvement = 0
-        for epoch in range(EPOCHS):
-            run_epoch(model, train_loader, optimizer, device, objective="mae")
-            val_mae = run_epoch(model, val_loader, optimizer=None, device=device)
-            val_mse = run_epoch(
-                model, val_loader, optimizer=None, device=device, objective="mse"
-            )
-            scheduler.step(val_mae)
-            if val_mae < best_validation_mae:
-                best_validation_mae = val_mae
-                best_epoch = epoch + 1
-                best_state = deepcopy(model.state_dict())
-                epochs_without_improvement = 0
-            else:
-                epochs_without_improvement += 1
-            print(
-                f"Seed {seed}, epoch {epoch + 1}/{EPOCHS} - "
-                f"Validation MAE: {val_mae:.5f} - Validation MSE: {val_mse:.5f} - "
-                f"lr: {optimizer.param_groups[0]['lr']:.2g}",
-                flush=True,
-            )
-            if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
-                print(
-                    f"Stopping early after {epoch + 1} epochs; validation MAE "
-                    f"has not improved for {EARLY_STOPPING_PATIENCE} epochs.",
-                    flush=True,
+        for fold, (train_indices, val_indices) in enumerate(folds):
+            models.append(
+                train_fold(
+                    train_ds, train_indices, val_indices,
+                    fold=fold, seed=seed, device=device,
                 )
-                break
-        model.load_state_dict(best_state)
-        model.eval()
-        models.append(model)
-        print(
-            f"Seed {seed}: best validation MAE {best_validation_mae:.5f} "
-            f"at epoch {best_epoch}.", flush=True,
-        )
+            )
 
     # Critical: associate every prediction with its own id, never with the
     # original dataframe's positional order after grouping breaths.
